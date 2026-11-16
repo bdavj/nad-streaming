@@ -1,0 +1,368 @@
+#!/usr/bin/perl
+# sovi-airplay: AirPlay (classic / AirPlay 1) source plugin for BluOS, replacing the binary that
+# Bluesound left out of this firmware. sovi-core launches it like this:
+#   sovi-airplay -z 1 -i <mac> -d /var/data/airplay -b NAD -M C368 -v 4.12.11 -e -C -U 107 -G 107 -N "1 <player name>"
+#
+#   iPhone --AirPlay--> shairport-sync (child, stdout backend) --PCM--> [this] --RTP--> dspout
+#                       shairport metadata pipe ------------------------> [this] --JSON--> sovi-core (display/app)
+#   amp remote / BluOS app -> sovi-core --H/G/S--> [this] --DACP--> iPhone
+#
+# Protocol notes: docs/PROTOCOL.md in https://github.com/<you>/nad-airplay
+use strict; use warnings;
+use Socket; use IO::Handle; use IO::Select; use IO::Socket::INET;
+use POSIX qw(mkfifo setsid WNOHANG :errno_h);
+use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK O_RDONLY O_WRONLY);
+use Time::HiRes qw(time sleep);
+use MIME::Base64 qw(decode_base64);
+use JSON::PP;
+use Sys::Syslog qw(:standard :macros);
+
+# ---------------------------------------------------------------- config
+my %arg; { my @a = @ARGV; while (@a) { my $k = shift @a; $arg{$k} = ($a[0] // '') !~ /^-/ ? shift @a : 1 } }
+my $DIR    = $arg{'-d'} || '/var/data/airplay';
+my $RUN    = '/tmp/sovi-airplay';                       # tmpfs: fifo + generated config
+my $SPS    = "$DIR/bin/shairport-sync";
+my $REQ    = "$DIR/airplay_req01";                      # plugin -> core
+my $CMD    = "$DIR/airplay_cmd01";                      # core -> plugin
+my $RTP    = '/var/data/pcm_rtp_socket01';              # -> dspout
+my $META   = "$RUN/metadata";
+my $LEAD_US = 250_000;                                  # play time ahead of dspout's clock (same as raat)
+my $FR     = 363;                                       # frames per RTP packet (same as raat)
+my $RATE   = 44100;
+my $GAP_S  = 3.0;                                       # no audio this long => stream ended (pause/stop)
+my $DEBUG  = -e "$DIR/debug";
+
+my $name = do { my $n = $arg{'-N'} // 'BluOS'; $n =~ s/^\d+\s+//; $n };
+if (open(my $f, '<', "$DIR/name")) { my $n = <$f>; chomp $n if defined $n; $name = $n if defined $n && length $n }
+
+openlog('sovi-airplay', 'pid', LOG_USER);
+sub lg  { syslog(LOG_INFO,  '%s', "@_") }
+sub dbg { syslog(LOG_DEBUG, '%s', "@_") if $DEBUG }
+lg("start: name='$name' argv=[@ARGV]");
+
+# ---------------------------------------------------------------- sockets
+socket(my $tx, PF_UNIX, SOCK_DGRAM, 0) or die "tx: $!";
+sub to_core { my ($m, $why) = @_;
+    my $r = send($tx, $m, MSG_DONTWAIT, sockaddr_un($REQ));
+    defined $r ? dbg("-> core $why") : lg("-> core $why FAILED: $!") }
+
+unlink $CMD;
+socket(my $rx, PF_UNIX, SOCK_DGRAM, 0) or die "rx: $!";
+bind($rx, sockaddr_un($CMD)) or die "bind $CMD: $!";
+chmod 0777, $CMD;
+
+socket(my $rtp, PF_UNIX, SOCK_DGRAM, 0) or die "rtp: $!";
+my $rtp_addr = sockaddr_un($RTP);
+
+# ---------------------------------------------------------------- shairport-sync child
+mkdir $RUN, 0755;
+unlink $META; mkfifo($META, 0666) or die "mkfifo: $!";
+sysopen(my $meta_r, $META, O_RDONLY | O_NONBLOCK) or die "meta: $!";
+sysopen(my $meta_w, $META, O_WRONLY | O_NONBLOCK) or die "meta keepalive: $!";  # never see EOF
+
+(my $qname = $name) =~ s/(["\\])/\\$1/g;
+open(my $cf, '>', "$RUN/shairport-sync.conf") or die; print $cf <<"EOF"; close $cf;
+general = {
+  name = "$qname";
+  output_backend = "stdout";
+  mdns_backend = "avahi";
+  ignore_volume_control = "yes";
+  audio_backend_latency_offset_in_seconds = -0.25;
+  allow_session_interruption = "yes";
+  session_timeout = 20;
+};
+metadata = {
+  enabled = "yes";
+  include_cover_art = "yes";
+  cover_art_cache_directory = "";
+  pipe_name = "$META";
+  pipe_timeout = 1000;
+};
+diagnostics = { log_verbosity = 0; };
+EOF
+
+my ($sps_pid, $audio, $sps_err, $next_start) = (undef, undef, undef, 0);
+sub start_sps {
+    pipe(my $ar, my $aw) or die; pipe(my $er, my $ew) or die;
+    my $pid = fork; die "fork: $!" unless defined $pid;
+    if (!$pid) {
+        close $ar; close $er; close $rx; close $meta_r; close $meta_w;
+        open(STDOUT, '>&', $aw); open(STDERR, '>&', $ew); open(STDIN, '<', '/dev/null');
+        setsid();
+        exec($SPS, '-c', "$RUN/shairport-sync.conf") or POSIX::_exit(127);
+    }
+    close $aw; close $ew;
+    for ($ar, $er) { my $fl = fcntl($_, F_GETFL, 0); fcntl($_, F_SETFL, $fl | O_NONBLOCK) }
+    ($sps_pid, $audio, $sps_err) = ($pid, $ar, $er);
+    lg("shairport-sync started, pid $pid");
+}
+sub stop_sps { if ($sps_pid) { kill 'TERM', -$sps_pid; kill 'TERM', $sps_pid } }
+my $quit = 0;
+$SIG{TERM} = $SIG{INT} = $SIG{HUP} = sub { $quit = 1 };
+$SIG{PIPE} = 'IGNORE';
+
+# ---------------------------------------------------------------- state
+my %st = (
+    phase => 'idle',          # idle | opening | live
+    sid => (time * 10) % 100000 | 0,
+    npos => undef, nreal => undef, live_clock => 0,
+    ts => undef, n => 0, seq => 0, last_audio => 0,
+    f_sent => 0, f_tries => 0, g_sent => 0,
+);
+my %md = (title => '', artist => '', album => '', dur_ms => 0, el_ms => 0, el_at => 0, playing => 0, cover => '');
+my %dacp;                     # ip, port, token
+my $abuf = '';
+my $suppress = 0;             # core told us to stop; ignore audio until the sender resumes
+
+sub now_pos_us { defined $st{npos} ? $st{npos} + (time * 1e6 - $st{nreal}) : undef }
+
+sub announce {
+    $st{sid} = ($st{sid} + 1) % 100000 || 1;
+    @st{qw(phase npos nreal live_clock ts n f_tries)} = ('opening', undef, undef, 0, undef, 0, 0);
+    to_core("P\x01", 'P1'); to_core("S\x00", 'S0'); to_core("L\x01", 'L1');
+    $st{f_sent} = time + 0.4;  # first F after a short settle (core may still be stopping another source)
+    lg("stream $st{sid}: opening");
+}
+sub send_f {
+    $st{f_tries}++; $st{f_sent} = time;
+    to_core("Fairplay_pcm01:pcm/$RATE/16/2/$st{sid}", "F #$st{f_tries}");
+    send_meta();
+}
+sub end_stream { my ($why) = @_;
+    return if $st{phase} eq 'idle';
+    lg("stream $st{sid}: end ($why)");
+    to_core('G', 'G'); $st{g_sent} = time; $md{playing} = 0; send_meta();
+    $st{phase} = 'idle'; $abuf = '';
+}
+sub send_meta {
+    my $el = $md{el_ms}; $el += (time - $md{el_at}) * 1000 if $md{playing} && $md{el_at};
+    to_core(encode_json({
+        isPlaying => $md{playing} ? JSON::PP::true : JSON::PP::false, isStream => JSON::PP::false,
+        title => $md{title}, album => $md{album}, artist => $md{artist}, cover => $md{cover},
+        rate => 0 + $RATE, duration_ms => 0 + int($md{dur_ms}), elapsed_ms => 0 + int($el), ts => 0,
+    }), 'metadata');
+}
+
+# ---------------------------------------------------------------- audio -> RTP
+my $PKT = $FR * 4;
+my $FRAME_US = 1e6 / $RATE;
+sub pump_audio {
+    while (length($abuf) >= $PKT) {
+        my $chunk = substr($abuf, 0, $PKT, '');
+        next unless $st{phase} eq 'live';
+        my $target = now_pos_us() + $LEAD_US;
+        my $err = defined $st{ts} ? $target - $st{ts} : 0;     # >0: packet would play too soon (late), <0: early
+        if (!defined $st{ts} || $err > 80_000 || $err < -3_000_000) {
+            lg(sprintf("stream %d: %s timeline (err %+.0f ms)", $st{sid}, defined $st{ts} ? 're-anchor' : 'anchor', $err / 1000));
+            $st{ts} = $target;
+        } else {
+            # follow the sender's clock slowly (max ~250 ppm), so bursts don't drag the timeline
+            my $c = $err * 0.002; $c = 2 if $c > 2; $c = -2 if $c < -2; $st{ts} += $c;
+        }
+        my $hdr = pack('CCvVvvCCvV', 0x80, 0xe0, $st{seq} & 0xffff, int($st{ts}) & 0xffffffff, $RATE / 50, $FR, 16, 0, 2, 0);
+        send($rtp, $hdr . $chunk, MSG_DONTWAIT, $rtp_addr) or dbg("rtp send: $!");
+        $st{seq}++; $st{ts} += $FR * $FRAME_US;
+    }
+}
+sub on_audio {
+    my $n = sysread($audio, my $b, 65536);
+    if (!defined $n) { return if $! == EAGAIN; $n = 0 }
+    if ($n == 0) { lg('shairport-sync audio pipe closed'); close $audio; $audio = undef; return }
+    $st{last_audio} = time;
+    return if $suppress;
+    if ($st{phase} eq 'idle') { announce() }
+    if ($st{phase} eq 'opening') { $abuf = substr($abuf . $b, -$PKT * 4); return }   # keep only a little
+    $abuf .= $b; pump_audio();
+}
+
+# ---------------------------------------------------------------- core -> plugin
+# Run a blocking job in a child process that ALWAYS exits (never returns into the main loop).
+sub in_child { my ($job) = @_;
+    my $pid = fork; return if !defined $pid || $pid;
+    eval { local $SIG{ALRM} = sub { die "timeout\n" }; alarm 4; $job->(); alarm 0 };
+    lg("child job failed: $@") if $@;
+    POSIX::_exit(0);
+}
+# Minimal HTTP GET over IPv4 or IPv6 (incl. link-local, scoped to eth0). Returns the status line.
+sub read_num { my ($path, $def) = @_; open(my $f, '<', $path) or return $def; my $v = <$f>; return defined $v && $v =~ /(-?[\d.]+)/ ? $1 + 0 : $def }
+my $IFIDX = read_num('/sys/class/net/eth0/ifindex', 0);
+sub http_get { my ($ip, $port, $path, @hdr) = @_;
+    my ($fam, $sa);
+    if ($ip =~ /:/) { (my $a = $ip) =~ s/%.*//; $fam = AF_INET6; $sa = Socket::pack_sockaddr_in6($port, Socket::inet_pton(AF_INET6, $a), $a =~ /^fe80/i ? $IFIDX : 0, 0) }
+    else            { $fam = AF_INET;  $sa = sockaddr_in($port, inet_aton($ip)) }
+    socket(my $s, $fam, SOCK_STREAM, 0) or die "socket: $!\n";
+    connect($s, $sa) or die "connect [$ip]:$port: $!\n";
+    my $host = $ip =~ /:/ ? "[$ip]" : $ip;
+    syswrite($s, join("\r\n", "GET $path HTTP/1.1", "Host: $host:$port", @hdr, 'Connection: close', '', ''));
+    my $resp = ''; while (sysread($s, my $chunk, 4096)) { $resp .= $chunk; last if length $resp > 65536 } close $s;
+    return wantarray ? $resp : (($resp =~ /^(HTTP\S+ \d+[^\r\n]*)/) ? $1 : 'no reply');
+}
+sub http_get_body { my @r = http_get(@_); return $r[0] }
+sub dacp { my ($cmd) = @_;
+    unless ($dacp{ip} && $dacp{port} && $dacp{token}) { lg("DACP $cmd: no remote info yet"); return }
+    my %d = %dacp;
+    in_child(sub { lg("DACP $cmd -> " . http_get($d{ip}, $d{port}, "/ctrl-int/1/$cmd", "Active-Remote: $d{token}")) });
+}
+# Phone volume -> amp. The phone's slider (-30..0 AirPlay dB) maps linearly onto amp $MIN_DB..$MAX_DB;
+# AirPlay mute (-144, slider at zero) -> BluOS mute (undone by moving the slider or a new session). The volume the phone reports on connect is ignored,
+# so connecting never changes the amp; only moving the slider does. BluOS /Volume?db=<delta> is relative,
+# so the child reads the current dB and applies the difference.
+my $MAX_DB = read_num("$DIR/max_db", -20);
+my $MIN_DB = read_num("$DIR/min_db", -70);
+my ($ap_seen, $vol_target, $vol_sent_at) = (0, undef, 0);
+sub on_pvol { my ($ap) = @_;
+    if (!$ap_seen) { $ap_seen = 1; dbg("initial phone volume $ap ignored"); return }
+    $vol_target = $ap <= -100 ? 'mute' : sprintf('%.1f', $MIN_DB + ($ap + 30) / 30 * ($MAX_DB - $MIN_DB));
+}
+sub flush_volume {
+    return unless defined $vol_target && time - $vol_sent_at > 0.3;     # rate-limit slider drags
+    my $t = $vol_target; $vol_target = undef; $vol_sent_at = time;
+    in_child(sub {
+        if ($t eq 'mute') { http_get('127.0.0.1', 11000, '/Volume?level=0'); return lg('volume: phone at zero -> level 0') }
+        my ($cur) = http_get_body('127.0.0.1', 11000, '/Volume') =~ /db="(-?[\d.]+)"/; $cur //= -100;
+        my $d = sprintf('%.1f', $t - $cur);
+        if ($cur <= -99 ) {                                    # at level 0 the relative step is unreliable: use level
+            my $lvl = int(($t + 70) / 0.7 + 0.5); $lvl = 1 if $lvl < 1;
+            http_get('127.0.0.1', 11000, "/Volume?level=$lvl"); return lg("volume: from silent -> level $lvl (~$t dB)") }
+        return if abs($d) < 0.5;
+        http_get('127.0.0.1', 11000, "/Volume?db=$d");
+        lg("volume: phone -> amp $t dB (was $cur)");
+    });
+}
+sub on_cmd {
+    recv($rx, my $b, 65536, 0); return unless length $b;
+    my $c = substr($b, 0, 1);
+    if ($c eq 'N') {
+        my ($pm, $rm, $x) = unpack('NNN', substr($b, 2, 12));
+        my $now_ms = time * 1000; my $real_ms = $now_ms - ($now_ms % 1e9) + $rm;
+        $real_ms -= 1e9 if $real_ms > $now_ms + 5e8;
+        my $live = $x >= 1000;                       # x = capture latency (us) once the hw clock runs
+        return if !$live && $st{live_clock};         # stale pre-roll report
+        if ($live && !$st{live_clock}) { $st{live_clock} = 1; undef $st{nreal} }
+        return if defined $st{nreal} && $real_ms * 1000 <= $st{nreal};
+        ($st{npos}, $st{nreal}) = ($pm * 1000, $real_ms * 1000);
+        if ($st{phase} eq 'opening' && $st{f_tries}) {
+            $st{phase} = 'live'; $st{ts} = undef; lg("stream $st{sid}: live"); pump_audio();
+        }
+        return;
+    }
+    (my $a = substr($b, 0, 80)) =~ s/[^\x20-\x7e]/./g;
+    dbg("<- core $c len=" . length($b) . " [$a]");
+    if    ($c eq 'F') { if (length($b) == 1) { lg('core: resume'); $suppress = 0; dacp('play') } }   # 'F'+id = stream accepted; bare 'F' = resume
+    elsif ($c eq 'O') { }                                         # output opened
+    elsif ($c eq 'R') { lg("player name: " . unpack('Z*', substr($b, 2))) }
+    elsif ($c eq 'K') { dbg("core volume: " . join(' ', grep length, split /\0/, substr($b, 6))) }
+    elsif ($c eq 'H') { lg('core: next'); dacp('nextitem') }
+    elsif ($c eq 'G') {                                           # remote/app pause (ignore core echoing our own G)
+        if ($st{phase} eq 'idle' || time - $st{g_sent} < 2) { dbg('core: G echo ignored') } else { lg('core: pause'); dacp('pause') } }
+    elsif ($c eq 'S') {
+        if ($st{phase} ne 'idle') { lg('core: stop (source changed?)'); $suppress = 1; dacp('pause'); $st{phase} = 'idle'; $abuf = '' }
+    }
+    else { lg("core: unhandled '$c' len=" . length($b) . ' hex=' . unpack('H*', substr($b, 0, 32))) }
+}
+
+# ---------------------------------------------------------------- shairport metadata
+my $mbuf = '';
+my %mpend;
+sub on_meta {
+    my $n = sysread($meta_r, my $b, 65536);
+    return unless $n;
+    $mbuf .= $b;
+    while ($mbuf =~ s{^.*?<item><type>([0-9a-f]{8})</type><code>([0-9a-f]{8})</code><length>(\d+)</length>(?:\s*<data encoding="base64">\s*(.*?)</data>)?\s*</item>}{}s) {
+        my ($type, $code, $len, $data) = (pack('H8', $1), pack('H8', $2), $3, defined $4 ? decode_base64($4) : '');
+        meta_item($type, $code, $data);
+    }
+    $mbuf = '' if length($mbuf) > 8_000_000;
+}
+my $AP_LATENCY_MS = 2000;                                         # classic AirPlay plays ~2 s after "current"
+sub meta_item { my ($t, $c, $d) = @_;
+    dbg("meta $t/$c " . ($c eq 'PICT' ? length($d) . ' bytes' : $d));
+    utf8::decode($d) unless $c eq 'PICT';
+    if ($t eq 'core') {                                          # DMAP track fields from the sender
+        if    ($c eq 'minm') { $mpend{title}  = $d }
+        elsif ($c eq 'asar') { $mpend{artist} = $d }
+        elsif ($c eq 'asal') { $mpend{album}  = $d }
+        elsif ($c eq 'astm') { $mpend{dur_ms} = unpack('N', $d) if length $d == 4 }
+        return;
+    }
+    return unless $t eq 'ssnc';                                  # shairport's own control/status codes
+    if    ($c eq 'mdst') { %mpend = () }
+    elsif ($c eq 'mden') { $md{$_} = $mpend{$_} for keys %mpend; lg("now playing: $md{artist} - $md{title}"); send_meta() if $st{phase} ne 'idle' }
+    elsif ($c eq 'PICT') { save_cover($d) }
+    elsif ($c eq 'prgr') {
+        my ($s, $cur, $e) = split m{/}, $d;
+        if (defined $e) { my $span = ($e - $s) & 0xffffffff; my $el = ($cur - $s) & 0xffffffff;
+            $md{dur_ms} = $span / $RATE * 1000;
+            $AP_LATENCY_MS = read_num("$DIR/latency_ms", 2000);
+            $md{el_ms} = $el / $RATE * 1000 - $AP_LATENCY_MS; $md{el_ms} = 0 if $md{el_ms} < 0;
+            $md{el_at} = time;
+            send_meta() if $st{phase} ne 'idle' }
+    }
+    elsif ($c eq 'pbeg') { $ap_seen = 0; $vol_target = undef; $suppress = 0; $md{playing} = 1; $md{el_at} = time }
+    elsif ($c eq 'prsm') { $suppress = 0; $md{playing} = 1; $md{el_at} = time }
+    elsif ($c eq 'pfls') {                                       # flush (pause/seek/skip): restart timeline on next audio
+        $st{ts} = undef; $abuf = '';
+        $md{el_ms} += (time - $md{el_at}) * 1000 if $md{playing} && $md{el_at}; $md{playing} = 0 }
+    elsif ($c eq 'pend') { end_stream('session ended'); to_core("P\x00", 'P0'); %dacp = (); $suppress = 0 }
+    elsif ($c eq 'pvol') { my ($ap) = split /,/, $d; on_pvol($ap) if defined $ap && $ap =~ /^-?[\d.]+$/ }
+    elsif ($c eq 'clip') { $dacp{ip} = $d }
+    elsif ($c eq 'dapo') { $dacp{port} = $d }
+    elsif ($c eq 'acre') { $dacp{token} = $d }
+    elsif ($c eq 'snam') { lg("client: $d") }
+}
+
+# ---------------------------------------------------------------- cover art
+# sovi-core serves /var/data/airplay/images/<file> itself (images.AddPathHandler in ms.Run) and builds the
+# image path as "<datadir>/airplay/<cover>", so cover = "images/<file>". Files live on tmpfs via a symlink.
+my $IMG = "$RUN/images";
+mkdir $IMG, 0755;
+if (-l "$DIR/images" || !-e "$DIR/images") { unlink "$DIR/images"; symlink($IMG, "$DIR/images") or lg("images symlink: $!") }
+my $cover_n = 0;
+sub save_cover { my ($img) = @_;
+    unlink glob("$IMG/cover-*");
+    if (!length $img) { $md{cover} = ''; send_meta() if $st{phase} ne 'idle'; return }
+    my $ext = substr($img, 0, 4) eq "\x89PNG" ? 'png' : 'jpg';
+    my $f = sprintf('cover-%d.%s', ++$cover_n, $ext);
+    open(my $o, '>', "$IMG/$f") or return lg("cover: $!"); binmode $o; print $o $img; close $o;
+    $md{cover} = "images/$f";
+    lg("cover art: $f (" . length($img) . " bytes)");
+    send_meta() if $st{phase} ne 'idle';
+}
+
+# ---------------------------------------------------------------- main loop
+my $errbuf = '';
+while (!$quit) {
+    if (!$sps_pid && time >= $next_start) { start_sps() }
+    my $sel = IO::Select->new($rx, $meta_r);
+    $sel->add($audio) if $audio; $sel->add($sps_err) if $sps_err;
+    for my $fh ($sel->can_read(0.05)) {
+        if    ($fh == $rx)     { on_cmd() }
+        elsif ($fh == $meta_r) { on_meta() }
+        elsif ($audio && $fh == $audio) { on_audio() }
+        elsif ($sps_err && $fh == $sps_err) {
+            my $n = sysread($sps_err, my $b, 4096);
+            if (!$n) { close $sps_err; $sps_err = undef; next }
+            $errbuf .= $b; while ($errbuf =~ s/^([^\n]*)\n//) { lg("sps: $1") if length $1 }
+        }
+    }
+    my $now = time;
+    flush_volume();
+    if ($st{phase} eq 'opening' && $now >= $st{f_sent} + ($st{f_tries} ? 1.0 : 0)) {
+        if ($st{f_tries} >= 5) { lg("stream $st{sid}: core never opened it, giving up"); $st{phase} = 'idle'; $suppress = 1 }
+        else { send_f() }
+    }
+    end_stream('audio stopped') if $st{phase} ne 'idle' && $now - $st{last_audio} > $GAP_S;
+    my $dead = 0;
+    while ((my $p = waitpid(-1, WNOHANG)) > 0) { $dead = 1 if $sps_pid && $p == $sps_pid }
+    if ($dead) {
+        lg("shairport-sync exited (status $?), restarting in 3 s");
+        end_stream('shairport-sync exited');
+        $sps_pid = undef; $next_start = $now + 3;
+        close $audio if $audio; $audio = undef;
+    }
+}
+lg('stopping');
+end_stream('shutdown'); to_core("P\x00", 'P0');
+stop_sps(); sleep 0.3; kill 'KILL', $sps_pid if $sps_pid && kill 0, $sps_pid;
+unlink $CMD;
+exit 0;

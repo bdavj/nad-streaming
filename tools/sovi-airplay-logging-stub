@@ -1,0 +1,47 @@
+#!/usr/bin/perl
+# Logging stub for BluOS's missing sovi-airplay daemon.
+# Logs how sovi-core launches it, then binds the (guessed) command socket and logs every datagram.
+# Sends nothing. Safe to kill at any time.
+use strict; use warnings;
+use Socket; use IO::Handle; use Cwd qw(getcwd); use POSIX qw(strftime setsid);
+use Time::HiRes qw(time);
+
+my $dir = '/var/data/airplay';
+my $log = "$dir/stub.log";
+open(my $L, '>>', $log) or die "log: $!";
+$L->autoflush(1);
+sub ts { my $t = time; strftime('%H:%M:%S', localtime $t) . sprintf('.%03d', ($t - int $t) * 1000) }
+sub lg { print $L ts() . " [$$] @_\n" }
+
+lg("START argv=[" . join('] [', @ARGV) . "] cwd=" . getcwd() . " ppid=" . getppid());
+lg("ENV " . join(' ', map { "$_=$ENV{$_}" } sort grep { !/KEY|TOKEN|PASS/i } keys %ENV));
+for my $fd (0 .. 20) {
+    my $t = readlink("/proc/$$/fd/$fd");
+    lg("FD $fd -> $t") if defined $t;
+}
+
+$SIG{TERM} = $SIG{INT} = $SIG{HUP} = sub { lg("SIGNAL $_[0], exiting"); exit 0 };
+
+# Bind the command socket in the cwd (where other plugins put theirs) and also in $dir.
+my @socks;
+for my $path (getcwd() . '/airplay_cmd01', "$dir/airplay_cmd01") {
+    next if grep { $_->[1] eq $path } @socks;
+    unlink $path;
+    socket(my $s, PF_UNIX, SOCK_DGRAM, 0) or do { lg("socket: $!"); next };
+    if (bind($s, sockaddr_un($path))) { lg("BOUND $path"); push @socks, [$s, $path] }
+    else { lg("bind $path: $!") }
+}
+
+my $rin = '';
+vec($rin, fileno($_->[0]), 1) = 1 for @socks;
+while (1) {
+    my $n = select(my $rout = $rin, undef, undef, 30);
+    if (!$n) { lg("idle"); next }
+    for my $sk (@socks) {
+        next unless vec($rout, fileno($sk->[0]), 1);
+        my $from = recv($sk->[0], my $buf, 65536, 0);
+        my $hex = join ' ', map { sprintf '%02x', $_ } unpack('C*', substr($buf, 0, 200));
+        (my $asc = substr($buf, 0, 200)) =~ s/[^\x20-\x7e]/./g;
+        lg("RECV on $sk->[1] len=" . length($buf) . " hex=[$hex] ascii=[$asc]");
+    }
+}

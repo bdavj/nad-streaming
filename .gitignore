@@ -1,0 +1,6 @@
+build/out/
+build/src/
+*.img
+*.tar
+*.st
+.DS_Store
